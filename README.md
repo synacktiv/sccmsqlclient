@@ -9,7 +9,7 @@ A dedicated MSSQL client for SCCM database exploration and exploitation.
 You can install by cloning the repository and installing the dependencies.
 
 ```sh
-$ git clone --recurse-submodules https://github.com/synacktiv/sccmsqlclient
+$ git clone https://github.com/synacktiv/sccmsqlclient
 $ cd sccmsqlclient
 $ python3 -m venv .venv && source .venv/bin/activate
 $ python3 -m pip install -r requirements.txt

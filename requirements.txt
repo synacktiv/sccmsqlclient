@@ -1,0 +1,4 @@
+impacket
+requests
+requests_toolbelt
+tabulate
