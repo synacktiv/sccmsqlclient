@@ -6,6 +6,15 @@ A dedicated MSSQL client for SCCM database exploration and exploitation.
 - Extract secrets
 
 ## Installation
+
+### PIPX
+
+```sh
+$ pipx install git+https://github.com/synacktiv/sccmsqlclient/
+```
+
+
+### PIP
 You can install by cloning the repository and installing the dependencies.
 
 ```sh
