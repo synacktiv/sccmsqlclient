@@ -33,7 +33,7 @@ def now():
 
 class SCCM_SQL_HTTP:
 
-    marker = 'X509'
+    marker = 'RSA'
 
     dummy_package_id = f"UID:{uuid.uuid4()}"
 
@@ -71,7 +71,7 @@ SELECT s.SiteCode, s.Version as Version, s.BuildNumber, @result as Settings, isn
 """
 
 
-    def __init__(self, target, key, cert, marker="X509", altAuth=False):
+    def __init__(self, target, key, cert, marker="RSA", altAuth=False):
         self._target = target
         self._target_url = f"{target}/ccm_system_altauth/request" if altAuth else f"{target}/ccm_system/request"
         self._pkey = key
