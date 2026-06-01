@@ -671,10 +671,17 @@ class SCCM_SQLSHELL(cmd.Cmd):
 
     def do_sccm_aad_apps(self, filter=""):
         self.__run(f"SELECT top {self._limit} a.ID, t.TenantID, t.Name as TenantName,  a.ClientID, a.Name, a.LastUpdateTime, a.SecretKeyExpiry, a.SecretKey, a.SecretKeyForSCP " 
-                   f"FROM CM_{self._site_code}..AAD_Application_Ex  a "
-                   f"LEFT JOIN CM_{self._site_code}..AAD_Tenant_Ex  t on t.ID = a.TenantDB_ID "
+                   f"FROM CM_{self._site_code}..AAD_Application_Ex a "
+                   f"LEFT JOIN CM_{self._site_code}..AAD_Tenant_Ex t on t.ID = a.TenantDB_ID "
                     f"WHERE a.Name LIKE '%{filter}%'")
-        
+    
+
+    def do_sccm_proxies(self, filter=""):
+        self.__run(f"SELECT top {self._limit} sru.NALPath, p.Name, p.Value2, p.Value3 " 
+                   f"FROM CM_{self._site_code}..SC_SysResUse_Property p "
+                   f"JOIN CM_{self._site_code}..SC_SysResUse sru ON sru.ID = p.SysResUseID "
+                    f"WHERE p.Name IN ('UseProxy', 'ProxyName', 'ProxyServerPort', 'AnonymousProxyAccess', 'ProxyUserName')")
+
     def do_sccm_decrypt_blob(self, line=None):
         if line is None or len(line.split(" ")) < 2 :
             logging.error("Missing arguments, user sccm_decrypt_blob [MP ResourceID] [BLOB] ")
